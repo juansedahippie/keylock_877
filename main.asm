@@ -1,6 +1,5 @@
-;	Imprime un mensaje que se lee de la EEPROM en un display LCD 
-;	16x2 en modo de operación 4 bits, utilizando flag de busy para
-;	saber cuando el display está listo para recibir datos.
+;	Caja fuerte con interacción mediante teclado matricial e inter-
+;	faz de usuario con display LCD 16x02
 ;
 ;	            PIC16F877A, DIP-40                                   
 ;	            +------------------U------------------+             
@@ -34,7 +33,11 @@
 ;	dos los pines del display se convierten en salidas y puede pro-
 ;	ducirse un corto. Estos pines quedan en HI-Z pero como no se
 ;	pregunta por su valor y se limpian antes de ser escritos no es
-;	algo crítico de solucionar.
+;	algo crítico de solucionar. RD7 es la señal de salida de la
+;	cerradura, la cuál se considera activa cuando su estado lógico
+;	es 1. Debe conectarse un pull-down a la misma, para que la salida
+;	nunca pueda estar en 1 salvo que explícitamente se ponga el bit
+;	en 1 (alta impedancia, condiciones de RESET).
 
 PROCESSOR 16F877A
 
