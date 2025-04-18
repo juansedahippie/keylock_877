@@ -1,5 +1,13 @@
-;	Caja fuerte con interacción mediante teclado matricial e inter-
-;	faz de usuario con display LCD 16x02
+;	Cerradura electrónica; la interfaz con el usuario se realiza con
+;	un teclado matricial y un display LCD. Permite, además de abrir y
+;	cerrar una cerradura con algún tipo de relé/electroimán, el cambio
+;	de contraseña, la cual se guarda de forma permanente en EEPROM. La
+;	contraseña por defecto es 123456. Se utiliza el pin RD7 para comu-
+;	nicar el estado a el actuador de la cerradura. El PORTB se utiliza
+;	para el teclado matricial utilizando la interrupción RBINT.
+;	Utiliza EEPROM con un display LCD 16x2 en modo de operación 4 bits,
+;	utilizando flag de busy para saber cuando el display está listo para
+;	recibir datos y así imprimir mensajes predeterminados en memoria.
 ;
 ;	            PIC16F877A, DIP-40                                   
 ;	            +------------------U------------------+             
@@ -13,7 +21,7 @@
 ;	       <> 8 | RE0/~RD/AN5                 INT/RB0 |33 <> FIL0   
 ;	       <> 9 | RE1/~WR/AN6                     VDD |32 <- +5V    
 ;	       <> 10| RE2/~CS/AN7                     VSS |31 <- GND    
-;	   +5V -> 11| VDD                        PSP7/RD7 |30 <>        
+;	   +5V -> 11| VDD                        PSP7/RD7 |30 -> ~LOCK  
 ;	   GND -> 12| VSS                        PSP6/RD6 |29 <>        
 ;	  XTAL -> 13| OSC1                       PSP5/RD5 |28 <>        
 ;	 20MHz <- 14| OSC2                       PSP4/RD4 |27 <>        
@@ -33,11 +41,7 @@
 ;	dos los pines del display se convierten en salidas y puede pro-
 ;	ducirse un corto. Estos pines quedan en HI-Z pero como no se
 ;	pregunta por su valor y se limpian antes de ser escritos no es
-;	algo crítico de solucionar. RD7 es la señal de salida de la
-;	cerradura, la cuál se considera activa cuando su estado lógico
-;	es 1. Debe conectarse un pull-down a la misma, para que la salida
-;	nunca pueda estar en 1 salvo que explícitamente se ponga el bit
-;	en 1 (alta impedancia, condiciones de RESET).
+;	algo crítico de solucionar.
 
 PROCESSOR 16F877A
 
@@ -78,12 +82,12 @@ loop:		CALL		work
 ; Interrupción
 
 int:		CALL		ctxt_save
-		BCF		STATUS, 5
+		BCF		STATUS, 5		; me paso al banco 0
 		BCF		STATUS, 6
-		BTFSC		INTCON, 0
+		BTFSC		INTCON, 0		; si saltó RBINT...
 			CALL		rbi_handler
 		BTFSC		INTCON, 2
-			CALL		t0i_handler
+			CALL		t0i_handler	; si saltó TMR0...
 		CALL		ctxt_rest
 		RETFIE
 
@@ -104,7 +108,7 @@ rbi_handler:	BTFSS		FLAGS, DEBOUNCE_TEST	; todavía no pregunto por rebote
 			CALL		debounce_fail	; recibí una tecla y resultó ser un rebote
 		MOVLW		(1 << DEBOUNCE_TEST)	; sin importar si estaba preguntando por rebote o no, cuando salta RBINT este flag se invierte
 		XORWF		FLAGS, F		; lo modifico aquí en vez de en debounce_start o debounce_fail porque sino se llamaría a ambas subrutinas
-		MOVF		PORTB, F
+		MOVF		PORTB, F		; actualizo PORTB para bajar flag
 		BCF		INTCON, 0		; apago flag
 		RETURN
 
@@ -121,8 +125,8 @@ t0i_handler:	CLRF		TMR0
 		BCF		INTCON, 5		; ya no salta TMR0
 		CALL		get_keycode		; leo tecla
 		MOVF		KEYCODE, W
-		SUBLW		15
-		BTFSS		STATUS, 0		; pregunto si la tecla es menor o igual a 15, si no es así no es una tecla válida
+		SUBLW		11
+		BTFSS		STATUS, 0		; pregunto si la tecla es menor o igual a 11, si no es así no es una tecla válida
 			RETURN
 		CALL		kycod_to_ascii		; traduzco el código de tecla al caracter ASCII que le corresponde
 		MOVWF		KEY_ASCII
@@ -174,7 +178,7 @@ init:		BCF		FLAGS, MCLR_RESET	; asumo por defecto que no hubo reset manual
 		MOVWF		TRISB			; nibble superior como entradas, nibble inferior como salidas (para usar teclado matricial)
 		CLRF		TRISC			; todo el puerto como salida
 		MOVLW		0x7F
-		MOVWF		TRISD
+		MOVWF		TRISD			; RD7 como salida
 		MOVLW		00000111B
 		MOVWF		OPTION_REG		; pull-ups internos activados, prescaler en 1:256
 		BSF		STATUS, 6
@@ -278,7 +282,7 @@ wait_lcd_ram:	; si tengo que mandar un dato a RAM, tengo que esperar a que el fl
 		CALL		wait_lcd_proc
 		MOVLW		5
 		MOVWF		CONT
-		DECFSZ		CONT, F			; rutina de retardo "inline", ~4uS
+		DECFSZ		CONT, F			; rutina de retardo "inline", ~2uS
 			GOTO		($-1)&0x7FF
 		RETURN
 
@@ -292,7 +296,7 @@ wait_lcd_proc:	; espero a que termine de procesar el LCD, se detecta cuando el f
 		BCF		STATUS, 5
 		BSF		PORTC, E		; pulso de enable inicial (leo BF)
 		NOP
-		BCF		PORTC, E		; loop de pulsos
+		BCF		PORTC, E		; (*) loop de pulsos
 		NOP
 		BSF		PORTC, E		; pulso de enable secundario (leo AC3)
 		NOP
@@ -301,7 +305,7 @@ wait_lcd_proc:	; espero a que termine de procesar el LCD, se detecta cuando el f
 		BSF		PORTC, E		; pulso de enable iterado (leo BF)
 		NOP
 		BTFSC		PORTC, 3		; pregunto si busy = 0
-			GOTO		($-9)&0x7FF	; loopeo pulso de enable y pregunto estado de busy
+			GOTO		($-9)&0x7FF	; loopeo pulso de enable y pregunto estado de busy (*)
 		BCF		PORTC, E
 		NOP
 		BSF		PORTC, E		; pulso de enable secundario (leo AC3)
@@ -320,6 +324,13 @@ clear_lcd:	; se limpia todo el display LCD y retorna a la posición original
 		CALL		send_lcd_inst
 		RETURN
 
+return_lcd:	; se retorna a la posición original
+		MOVLW		0x80 | 0x00
+		MOVWF		LCD_DATA
+		CALL		wait_lcd_inst
+		CALL		send_lcd_inst
+		RETURN
+
 ; Rutinas de máquina de estados
 
 STATE		equ		0x40			; estado actual
@@ -330,22 +341,32 @@ RESET_TO_CLOSED	equ		1
 CLOSED		equ		2
 CLOSE_TO_READ	equ		3
 READ		equ		4
-READ_TO_FAIL	equ		5
-FAIL		equ		6
-FAIL_TO_CLOSED	equ		7
-READ_TO_SUCC	equ		8
-SUCC		equ		9
-SUCC_TO_OPEN	equ		10
-OPEN		equ		11
-OPEN_TO_CLOSE	equ		12
-OPEN_TO_CHANGE	equ		13
-CHANGE		equ		14
-CHANGE_TO_NEW	equ		15
-NEW		equ		16
-NEW_TO_OPEN	equ		17
+READ_TO_CO_RD	equ		5
+CO_RD		equ		6
+CO_RD_TO_READ	equ		7
+CO_RD_TO_FAIL	equ		8
+FAIL		equ		9
+FAIL_TO_CLOSED	equ		10
+CO_RD_TO_SUCC	equ		11
+SUCC		equ		12
+SUCC_TO_OPEN	equ		13
+OPEN		equ		14
+OPEN_TO_CLOSE	equ		15
+OPEN_TO_CHANGE	equ		16
+CHANGE		equ		17
+CHANGE_TO_CO_CH	equ		18
+CO_CH		equ		19
+CO_CH_TO_CHANGE	equ		20
+CO_CH_TO_NEW	equ		21
+NEW		equ		22
+NEW_TO_OPEN	equ		23
 
 		psect	work_switch, global, abs, ovrld, delta=2, class=CODE
 		ORG	0x100
+
+RAM_PWD_INDEX	equ		0x42			; guardo el índice de la dirección de contraseña que se usa actualmente
+RAM_PWD		equ		0x43			; buffer de contraseña, abarca de 0x43 a 0x43+PWD_LENGHT
+PWD_LENGHT	equ		6
 
 work:		; switcheo entre los distintos estados, deben estar en orden numérico
 		MOVLW		high(work)
@@ -363,13 +384,19 @@ work:		; switcheo entre los distintos estados, deben estar en orden numérico
 		RETURN
 		CALL		st_rd
 		RETURN
-		CALL		st_rd_to_fl
+		CALL		st_rd_to_cr
+		RETURN
+		CALL		st_cr
+		RETURN
+		CALL		st_cr_to_rd
+		RETURN
+		CALL		st_cr_to_fl
 		RETURN
 		CALL		st_fl
 		RETURN
 		CALL		st_fl_to_cl
 		RETURN
-		CALL		st_rd_to_su
+		CALL		st_cr_to_su
 		RETURN
 		CALL		st_su
 		RETURN
@@ -383,7 +410,13 @@ work:		; switcheo entre los distintos estados, deben estar en orden numérico
 		RETURN
 		CALL		st_ch
 		RETURN
-		CALL		st_ch_to_nw
+		CALL		st_ch_to_cc
+		RETURN
+		CALL		st_cc
+		RETURN
+		CALL		st_cc_to_ch
+		RETURN
+		CALL		st_cc_to_nw
 		RETURN
 		CALL		st_nw
 		RETURN
@@ -392,13 +425,17 @@ work:		; switcheo entre los distintos estados, deben estar en orden numérico
 
 st_rs_to_cl:
 st_cl_to_rd:
-st_rd_to_fl:
+st_rd_to_cr:
+st_cr_to_rd:
+st_cr_to_fl:
 st_fl_to_cl:
-st_rd_to_su:
+st_cr_to_su:
 st_su_to_op:
 st_op_to_cl:
 st_op_to_ch:
-st_ch_to_nw:
+st_ch_to_cc:
+st_cc_to_ch:
+st_cc_to_nw:
 st_nw_to_op:	; se imprimen los mensajes de transición entre estados, todas estas subrutinas hacen lo mismo
 		CALL		eeprm_read_it		; leo de la dirección de EEPROM fijada e incremento dirección para un futuro
 		IORLW		0			; si devolvió 0, recibí un valor y debo seguir leyendo
@@ -439,30 +476,29 @@ st_rs:		CLRF		RAM_PWD_INDEX		; limpio índice de buffer de contraseña
 		RETURN
 
 st_cl:		; espero hasta que se presione una tecla para pasar a ingresar contraseña
-		;SLEEP					; no despierta del SLEEP, sigo con otra parte del código
-		;NOP
+		SLEEP
+		NOP
 		BTFSS		FLAGS, NEW_KEY		; recibí nueva tecla con RBINT?
 			RETURN
 		BCF		FLAGS, NEW_KEY		; limpio flag
+		BCF		INTCON, 3		; como paso a una transición, deshabilito el teclado hasta que se imprima mensaje
 		MOVLW		EEPRM_CL_TO_RD
 		CALL		eeprm_init_rd		; inicializo EEPROM
 		MOVLW		CLOSE_TO_READ
 		MOVWF		STATE			; paso a transición entre CLOSED y READ
 		MOVLW		READ
 		MOVWF		NXT_STATE		; aviso que el siguiente estado será READ
-		BCF		INTCON, 3		; como paso a una transición, deshabilito el teclado hasta que se imprima mensaje
 		CALL		clear_lcd		; limpio LCD para imprimir mensaje nuevo
 		RETURN
 
-RAM_PWD_INDEX	equ		0x42			; guardo el índice de la dirección de contraseña que se usa actualmente
-RAM_PWD		equ		0x43			; buffer de contraseña, abarca de 0x43 a 0x43+PWD_LENGHT
-PWD_LENGHT	equ		6
-
 st_rd:		; espero hasta que se presione una tecla y la guardo en el buffer de contraseña; cuando el buffer se llena,
 		; pregunto si el contenido del buffer coincide con la contraseña guardada en EEPROM
+		SLEEP
+		NOP
 		BTFSS		FLAGS, NEW_KEY		; recibí nueva tecla con RBINT?
 			RETURN
 		BCF		FLAGS, NEW_KEY		; limpio flag
+		BCF		INTCON, 3
 		MOVLW		RAM_PWD
 		ADDWF		RAM_PWD_INDEX, W
 		MOVWF		FSR			; apunto a RAM_PWD + INDEX con FSR
@@ -474,15 +510,50 @@ st_rd:		; espero hasta que se presione una tecla y la guardo en el buffer de con
 		INCF		RAM_PWD_INDEX, F	; incremento el índice para atacar la siguiente posición
 		MOVF		RAM_PWD_INDEX, W
 		XORLW		PWD_LENGHT		; pregunto si el índice llegó a su valor máximo + 1
+		MOVF		PORTB, F
+		BCF		INTCON, 0
+		BSF		INTCON, 3
 		BTFSS		STATUS, 2
 			RETURN				; si INDEX < PWD_LENGTH, sigo recibiendo en buffer contraseña
-		CLRF		RAM_PWD_INDEX		; si se llenó el buffer contraseña, limpio índice y valido contraseña
+		BCF		INTCON, 3		; si se llenó el buffer contraseña, limpio índice y valido contraseña
+		CLRF		RAM_PWD_INDEX
+		MOVLW		EEPRM_RD_TO_CR
+		CALL		eeprm_init_rd
+		MOVLW		READ_TO_CO_RD
+		MOVWF		STATE			; paso a transición entre CLOSED y READ
+		MOVLW		CO_RD
+		MOVWF		NXT_STATE		; aviso que el siguiente estado será READ
+		CALL		return_lcd
+		RETURN
+
+st_cr:		SLEEP
+		NOP
+		BTFSS		FLAGS, NEW_KEY
+			RETURN
+		BCF		FLAGS, NEW_KEY
+		BCF		INTCON, 3
+		MOVLW		'#'
+		XORWF		KEY_ASCII, W
+		BTFSS		STATUS, 2
+			GOTO		($+9)&0x7FF
+		MOVLW		EEPRM_CR_TO_RD
+		CALL		eeprm_init_rd
+		MOVLW		CO_RD_TO_READ
+		MOVWF		STATE
+		MOVLW		READ
+		MOVWF		NXT_STATE
+		CALL		clear_lcd
+		RETURN
+		MOVLW		'*'
+		XORWF		KEY_ASCII, W
+		BTFSS		STATUS, 2
+			GOTO		($+40)&0x7FF
 		MOVLW		EEPRM_PWD
 		CALL		eeprm_init_rd		; inicializo EEPROM con la dirección de la contraseña
 		CALL		eeprm_read_it		; (*) leo dirección actual, loop de lectura de EEPROM
 		IORLW		0
 		BTFSS		STATUS, 2		; pregunto si llegué al final de la contraseña (se detecta si se leyó 0xFF) ANTES de haber llegado al valor máximo de índice (condición de error)
-			GOTO		($+25)&0x7FF		; si llegué al fin de la contraseña paso a comparar con buffer (+)
+			GOTO		($+24)&0x7FF		; si llegué al fin de la contraseña paso a comparar con buffer (+)
 		MOVLW		RAM_PWD
 		ADDWF		RAM_PWD_INDEX, W
 		MOVWF		FSR			; apunto a posición actual de buffer contraseña
@@ -491,117 +562,163 @@ st_rd:		; espero hasta que se presione una tecla y la guardo en el buffer de con
 		XORWF		EEDATA, W		; pregunto si vale lo mismo que la posición
 		BCF		STATUS, 6
 		BTFSS		STATUS, 2		; pregunto si vale lo mismo el buffer contraseña que la contraseña en la posición actual
-			GOTO		($+16)&0x7FF		; si no valen lo mismo, falló validación de contraseña (+)
+			GOTO		($+15)&0x7FF		; si no valen lo mismo, falló validación de contraseña (+)
 		INCF		RAM_PWD_INDEX, F	; si valen lo mismo, incremento índice
 		MOVF		RAM_PWD_INDEX, W
 		XORLW		PWD_LENGHT		; si el índice llegó a su valor máximo, la contraseña leída es válida y abro la cerradura
 		BTFSS		STATUS, 2
 			GOTO		($-17)&0x7FF		; si índice no llegó a su valor máximo, loopeo lectura y validación (*)
 		CLRF		RAM_PWD_INDEX		; la contraseña leída fue válida, limpio el índice
-		MOVLW		EEPRM_RD_TO_SU
+		MOVLW		EEPRM_CR_TO_SU
 		CALL		eeprm_init_rd		; inicializo EEPROM
-		MOVLW		READ_TO_SUCC
+		MOVLW		CO_RD_TO_SUCC
 		MOVWF		STATE			; paso a transición entre READ y SUCC
 		MOVLW		SUCC
 		MOVWF		NXT_STATE		; se transiciona a SUCC
-		BCF		INTCON, 3		; dejo de atender al teclado hasta que se imprima mensaje
 		CALL		clear_lcd		; limpio LCD
 		RETURN
 		CLRF		RAM_PWD_INDEX		; (+) la contraseña no fue válida o hubo un error
-		MOVLW		EEPRM_RD_TO_FL
+		MOVLW		EEPRM_CR_TO_FL
 		CALL		eeprm_init_rd		; inicializo EEPROM
-		MOVLW		READ_TO_FAIL
+		MOVLW		CO_RD_TO_FAIL
 		MOVWF		STATE			; paso a transición entre READ y FAIL
 		MOVLW		FAIL
 		MOVWF		NXT_STATE		; se transiciona a FAIL
 		BCF		INTCON, 3		; dejo de atender al teclado hasta que se imprima mensaje
 		CALL		clear_lcd		; limpio LCD
 		RETURN
+		MOVF		PORTB, F
+		BCF		INTCON, 0
+		BSF		INTCON, 3
+		RETURN
 
 st_fl:		; la contraseña que se leyó no fue válida, se vuelve a CLOSED pero antes se escribe en el LCD que
 		; se equivocó de contraseña, y se espera a que presione una tecla para confirmar que leyó el mensaje
-		;SLEEP					; no despierta del SLEEP, sigo con otra parte del código
-		;NOP
+		SLEEP
+		NOP
 		BTFSS		FLAGS, NEW_KEY		; recibí nueva tecla con RBINT?
 			RETURN
 		BCF		FLAGS, NEW_KEY		; limpio flag
+		BCF		INTCON, 3		; como paso a una transición, deshabilito el teclado hasta que se imprima mensaje
 		MOVLW		EEPRM_FL_TO_CL
 		CALL		eeprm_init_rd		; inicializo EEPROM
 		MOVLW		FAIL_TO_CLOSED
 		MOVWF		STATE			; paso a transición entre FAIL y CLOSED
 		MOVLW		CLOSED
 		MOVWF		NXT_STATE		; aviso que el siguiente estado será CLOSED
-		BCF		INTCON, 3		; como paso a una transición, deshabilito el teclado hasta que se imprima mensaje
 		CALL		clear_lcd		; limpio LCD para imprimir mensaje nuevo
 		RETURN
 
 st_su:		; la contraseña que se leyó fue válida, se pasa a OPEN, se escribe en el LCD que la contraseña fue
 		; correcta y se espera a que se presione una tecla para confirmar que se leyó el mensaje. Se abre la
 		; cerradura una vez que el usuario presionó una tecla
-		;SLEEP					; no despierta del SLEEP, sigo con otra parte del código
-		;NOP
+		SLEEP
+		NOP
 		BTFSS		FLAGS, NEW_KEY		; recibí nueva tecla con RBINT?
 			RETURN
 		BCF		FLAGS, NEW_KEY		; limpio flag
+		BCF		INTCON, 3		; como paso a una transición, deshabilito el teclado hasta que se imprima mensaje
 		MOVLW		EEPRM_SU_TO_OP
 		CALL		eeprm_init_rd		; inicializo EEPROM
 		MOVLW		SUCC_TO_OPEN
 		MOVWF		STATE			; paso a transición entre SUCC y OPEN
 		MOVLW		OPEN
 		MOVWF		NXT_STATE		; aviso que el siguiente estado será OPEN
-		BCF		INTCON, 3		; como paso a una transición, deshabilito el teclado hasta que se imprima mensaje
 		CALL		clear_lcd		; limpio LCD para imprimir mensaje nuevo
 		BSF		PORTD, 7		; abro cerradura
 		RETURN
 
-st_op:		BTFSS		FLAGS, NEW_KEY
+st_op:		SLEEP
+		NOP
+		BTFSS		FLAGS, NEW_KEY
 			RETURN
 		BCF		FLAGS, NEW_KEY
+		BCF		INTCON, 3
 		MOVLW		'#'
 		XORWF		KEY_ASCII, W
 		BTFSS		STATUS, 2
-			GOTO		($+10)&0x7FF
+			GOTO		($+9)&0x7FF
 		MOVLW		EEPRM_OP_TO_CH
 		CALL		eeprm_init_rd
 		MOVLW		OPEN_TO_CHANGE
 		MOVWF		STATE
 		MOVLW		CHANGE
 		MOVWF		NXT_STATE
-		BCF		INTCON, 3
 		CALL		clear_lcd
 		RETURN
 		MOVLW		'*'
 		XORWF		KEY_ASCII, W
 		BTFSS		STATUS, 2
-			RETURN
+			GOTO		($+10)&0x7FF
 		MOVLW		EEPRM_OP_TO_CL
 		CALL		eeprm_init_rd
 		MOVLW		OPEN_TO_CLOSE
 		MOVWF		STATE
 		MOVLW		CLOSED
 		MOVWF		NXT_STATE
-		BCF		INTCON, 3
 		CALL		clear_lcd
 		BCF		PORTD, 7		; cierro cerradura
 		RETURN
+		MOVF		PORTB, F
+		BCF		INTCON, 0
+		BSF		INTCON, 3
+		RETURN
 
-st_ch:		BTFSS		FLAGS, NEW_KEY
+st_ch:		SLEEP
+		NOP
+		BTFSS		FLAGS, NEW_KEY		; recibí nueva tecla con RBINT?
 			RETURN
-		BCF		FLAGS, NEW_KEY
+		BCF		FLAGS, NEW_KEY		; limpio flag
+		BCF		INTCON, 3
 		MOVLW		RAM_PWD
 		ADDWF		RAM_PWD_INDEX, W
-		MOVWF		FSR
+		MOVWF		FSR			; apunto a RAM_PWD + INDEX con FSR
 		MOVF		KEY_ASCII, W
-		MOVWF		INDF
-		MOVWF		LCD_DATA
+		MOVWF		INDF			; sobreescribo esa dirección con la tecla recibida
+		MOVWF		LCD_DATA		; imprimo tecla recibida en el LCD
 		CALL		wait_lcd_ram
 		CALL		send_lcd_ram
-		INCF		RAM_PWD_INDEX, F
+		INCF		RAM_PWD_INDEX, F	; incremento el índice para atacar la siguiente posición
 		MOVF		RAM_PWD_INDEX, W
-		XORLW		PWD_LENGHT
+		XORLW		PWD_LENGHT		; pregunto si el índice llegó a su valor máximo + 1
+		MOVF		PORTB, F
+		BCF		INTCON, 0
+		BSF		INTCON, 3
+		BTFSS		STATUS, 2
+			RETURN				; si INDEX < PWD_LENGTH, sigo recibiendo en buffer contraseña
+		BCF		INTCON, 3		; si se llenó el buffer contraseña, limpio índice y valido contraseña
+		CLRF		RAM_PWD_INDEX
+		MOVLW		EEPRM_CH_TO_CC
+		CALL		eeprm_init_rd
+		MOVLW		CHANGE_TO_CO_CH
+		MOVWF		STATE			; paso a transición entre CLOSED y READ
+		MOVLW		CO_CH
+		MOVWF		NXT_STATE		; aviso que el siguiente estado será READ
+		CALL		return_lcd
+		RETURN
+
+st_cc:		SLEEP
+		NOP
+		BTFSS		FLAGS, NEW_KEY
+			RETURN
+		BCF		FLAGS, NEW_KEY
+		BCF		INTCON, 3
+		MOVLW		'#'
+		XORWF		KEY_ASCII, W
+		BTFSS		STATUS, 2
+			GOTO		($+9)&0x7FF
+		MOVLW		EEPRM_CC_TO_CH
+		CALL		eeprm_init_rd
+		MOVLW		CO_CH_TO_CHANGE
+		MOVWF		STATE
+		MOVLW		CHANGE
+		MOVWF		NXT_STATE
+		CALL		clear_lcd
+		RETURN
+		MOVLW		'*'
+		XORWF		KEY_ASCII, W
 		BTFSS		STATUS, 2
 			RETURN
-		CLRF		RAM_PWD_INDEX
 		BCF		INTCON, 7		; deshabilito interrupciones para escribir EEPROM
 		MOVLW		EEPRM_PWD
 		CALL		eeprm_init_wr
@@ -615,7 +732,7 @@ st_ch:		BTFSS		FLAGS, NEW_KEY
 		CALL		eeprm_write_it
 		IORLW		0
 		BTFSS		STATUS, 2
-			GOTO		($-14)&0x7FF
+			GOTO		($-12)&0x7FF
 		INCF		RAM_PWD_INDEX, F
 		MOVF		RAM_PWD_INDEX, W
 		XORLW		PWD_LENGHT
@@ -623,28 +740,27 @@ st_ch:		BTFSS		FLAGS, NEW_KEY
 			GOTO		($-15)&0x7FF
 		CLRF		RAM_PWD_INDEX
 		BSF		INTCON, 7
-		MOVLW		EEPRM_CH_TO_NW
+		MOVLW		EEPRM_CC_TO_NW
 		CALL		eeprm_init_rd
-		MOVLW		CHANGE_TO_NEW
+		MOVLW		CO_CH_TO_NEW
 		MOVWF		STATE
 		MOVLW		NEW
 		MOVWF		NXT_STATE
-		BCF		INTCON, 3
 		CALL		clear_lcd
 		RETURN
 
-st_nw:		;SLEEP					; no despierta del SLEEP, sigo con otra parte del código
-		;NOP
+st_nw:		SLEEP
+		NOP
 		BTFSS		FLAGS, NEW_KEY
 			RETURN
 		BCF		FLAGS, NEW_KEY
+		BCF		INTCON, 3
 		MOVLW		EEPRM_NW_TO_OP
 		CALL		eeprm_init_rd
 		MOVLW		NEW_TO_OPEN
 		MOVWF		STATE
 		MOVLW		OPEN
 		MOVWF		NXT_STATE
-		BCF		INTCON, 3
 		CALL		clear_lcd
 		RETURN
 
@@ -673,6 +789,16 @@ eeprm_read_it:	; código para leer EEPROM
 			RETLW		1
 		RETLW		0
 
+eeprm_init_wr:	; inicializo la dirección de EEPROM con una dirección guardada en W y 
+		; configuro bits de escritura para poder llamar a eeprm_write_it
+		BSF		STATUS, 6
+		MOVWF		EEADR
+		BSF		STATUS, 5
+		BSF		EECON1, 2
+		BCF		STATUS, 5
+		BCF		STATUS, 6
+		RETURN
+
 eeprm_write_it:	; código para sobreescribir EEPROM
 		BSF		STATUS, 6
 		BSF		STATUS, 5
@@ -693,16 +819,6 @@ eeprm_write_it:	; código para sobreescribir EEPROM
 		BTFSC		STATUS, 2
 			RETLW		1
 		RETLW		0
-
-eeprm_init_wr:	; inicializo la dirección de EEPROM con una dirección guardada en W y 
-		; configuro bits de escritura para poder llamar a eeprm_write_it
-		BSF		STATUS, 6
-		MOVWF		EEADR
-		BSF		STATUS, 5
-		BSF		EECON1, 2
-		BCF		STATUS, 5
-		BCF		STATUS, 6
-		RETURN
 
 ; Look-up tables
 
@@ -725,7 +841,7 @@ filcol_table:	; tabla auxiliar para teclado matricial
 		RETLW		2 * CANT_COLS
 		RETLW		16
 		RETLW		16
-		RETLW		3
+		RETLW		16
 		RETLW		3 * CANT_COLS
 		RETLW		16
 		RETLW		16
@@ -752,10 +868,6 @@ kycod_to_ascii:	; tabla de conversión entre índice de tecla y su valor ASCII c
 		RETLW		'#'
 		RETLW		'0'
 		RETLW		'*'
-		RETLW		'A'
-		RETLW		'B'
-		RETLW		'C'
-		RETLW		'D'
 
 ; Escritura de EEPROM
 
@@ -771,20 +883,25 @@ EEPRM_OP_TO_CL:	DB		'C', 'e', 'r', 'r', 'a', 'd', 'o', ',', 0x00, 'e', 's', 'p',
 
 		; mensaje de CLOSED_TO_READ y OPEN_TO_CHANGE
 EEPRM_CL_TO_RD:
-EEPRM_OP_TO_CH:	DB		'I', 'n', 'g', 'r', 'e', 's', 'e', ' ', 'c', 'o', 'n', 't', 'r', 'a', ':', 0x00, ' ', ' ', ' ', ' ', ' ', 0xFF
+EEPRM_CR_TO_RD:
+EEPRM_OP_TO_CH:
+EEPRM_CC_TO_CH:	DB		'I', 'n', 'g', 'r', 'e', 's', 'e', ' ', 'c', 'o', 'n', 't', 'r', 'a', ':', 0x00, ' ', ' ', ' ', ' ', ' ', 0xFF
 
 		; mensaje de FAIL_TO_CLOSE
-EEPRM_RD_TO_FL:	DB		'C', 'o', 'n', 't', 'r', 'a', ' ', 'f', 'a', 'l', 'l', 'i', 'd', 'a', 0x00, 'e', 's', 'p', 'e', 'r', 'a', 'n', 'd', 'o', ' ', 't', 'e', 'c', 'l', 'a', 0xFF
+EEPRM_CR_TO_FL:	DB		'C', 'o', 'n', 't', 'r', 'a', ' ', 'f', 'a', 'l', 'l', 'i', 'd', 'a', 0x00, 'e', 's', 'p', 'e', 'r', 'a', 'n', 'd', 'o', ' ', 't', 'e', 'c', 'l', 'a', 0xFF
 
 		; mensaje de READ_TO_SUCC
-EEPRM_RD_TO_SU:	DB		'C', 'o', 'n', 't', 'r', 'a', ' ', 'c', 'o', 'r', 'r', 'e', 'c', 't', 'a', 0x00, 'e', 's', 'p', 'e', 'r', 'a', 'n', 'd', 'o', ' ', 't', 'e', 'c', 'l', 'a', 0xFF
+EEPRM_CR_TO_SU:	DB		'C', 'o', 'n', 't', 'r', 'a', ' ', 'c', 'o', 'r', 'r', 'e', 'c', 't', 'a', 0x00, 'e', 's', 'p', 'e', 'r', 'a', 'n', 'd', 'o', ' ', 't', 'e', 'c', 'l', 'a', 0xFF
 
 		; mensaje de SUCC_TO_OPEN y NEW_TO_OPEN
 EEPRM_SU_TO_OP:
 EEPRM_NW_TO_OP:	DB		'A', 'b', 'i', 'e', 'r', 't', 'o', ' ', '*', '.', 'C', 'i', 'e', 'r', 'r', 'a', 0x00, '#', '.', 'C', 'a', 'm', 'b', 'i', 'a', 'r', 0xFF
 
 		; mensaje de CHANGE_TO_NEW
-EEPRM_CH_TO_NW:	DB		'C', 'o', 'n', 't', 'r', 'a', ' ', 'n', 'u', 'e', 'v', 'a', 0x00, 'e', 's', 'p', 'e', 'r', 'a', 'n', 'd', 'o', ' ', 't', 'e', 'c', 'l', 'a', 0xFF
+EEPRM_CC_TO_NW:	DB		'C', 'o', 'n', 't', 'r', 'a', ' ', 'n', 'u', 'e', 'v', 'a', 0x00, 'e', 's', 'p', 'e', 'r', 'a', 'n', 'd', 'o', ' ', 't', 'e', 'c', 'l', 'a', 0xFF
 
+		; mensaje de confirmar contraseña
+EEPRM_RD_TO_CR:
+EEPRM_CH_TO_CC:	DB		'*', '.', 'O', 'k', ' ', '#', '.', 'R', 'e', 'i', 'n', 't', 'e', 'n', 't', 'a', 0xFF
 
 		END	main
